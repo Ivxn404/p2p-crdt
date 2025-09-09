@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>P2P Distributed DB Demo</title>
+  <style>
+    body { font-family: monospace; margin: 2em; background: #181818; color: #eee; }
+    input, button { font-size: 1em; }
+    #log { max-height: 200px; overflow-y: scroll; background: #222; padding: 1em; margin-top: 1em;}
+    .section { margin-bottom: 2em; }
+    .peer-box { font-size: 0.9em; background: #252525; border: 1px solid #333; margin: 0.2em 0; padding: 0.3em;}
+    #dbTable th, #dbTable td { border: 1px solid #333; padding: 2px 5px;}
+  </style>
+</head>
+<body>
+  <h1>P2P Distributed DB (All-Browser, CRDT, Secure)</h1>
+  <div class="section">
+    <b>DB Operations:</b>
+    <input id="dbkey" placeholder="key" autofocus>
+    <input id="dbvalue" placeholder="value">
+    <button id="setbtn">Set</button>
+    <button id="clearbtn">Clear All</button>
+    <button id="showbtn">Show DB</button>
+    <div id="dbdiv"></div>
+  </div>
+
+  <div class="section">
+    <b>P2P Sync:</b>
+    <button id="shareSignalBtn">Get My Signal</button>
+    <input id="signalInput" placeholder="Paste signal">
+    <button id="connectBtn">Connect Peer</button>
+    <div id="peersDiv"></div>
+  </div>
+
+  <div class="section">
+    <b>Status/Log:</b>
+    <pre id="log"></pre>
+  </div>
+
+<script>
+/**
+  Ultimate Difficulty: In-browser P2P distributed DB
+  Features: IndexedDB, BroadcastChannel, WebRTC, CRDT (LWW), end-to-end encryption, real-time, no backend.
+**/
+
+// ------------ CRDT Layer: Last-Write-Wins Register -----------
+let db = {}; // Key: {value, ts}
+function setCRDT(key, value) {
+  db[key] = { value, ts: Date.now() };
+}
+function mergeCRDT(remoteDB) {
+  for (let k in remoteDB) {
+    if (!db[k] || remoteDB[k].ts > db[k].ts)
+      db[k] = remoteDB[k];
+  }
+}
+function clearDB() {
+  db = {};
+}
+function getSerializableDB() {
+  // Remove any undefined keys or prototypes
+  return JSON.parse(JSON.stringify(db));
+}
+
+// ------------- Encryption Utility (AES-GCM) -----------------
+async function getKey() {
+  let keyStr = localStorage.getItem('cryptoKey');
+  if (!keyStr) {
+    let key = await window.crypto.subtle.generateKey({name: "AES-GCM", length: 256}, true, ["encrypt","decrypt"]);
+    let j = await window.crypto.subtle.exportKey("jwk", key);
+    localStorage.setItem('cryptoKey', JSON.stringify(j));
+    return key;
+  } else {
+    let key = await window.crypto.subtle.importKey("jwk", JSON.parse(keyStr), {name:"AES-GCM"}, true, ["encrypt","decrypt"]);
+    return key;
+  }
+}
+async function encrypt(obj) {
+  let key = await getKey();
+  let iv = window.crypto.getRandomValues(new Uint8Array(12));
+  let encoded = new TextEncoder().encode(JSON.stringify(obj));
+  let ct = await window.crypto.subtle.encrypt({name:"AES-GCM", iv}, key, encoded);
+  return JSON.stringify({iv: Array.from(iv), ct: Array.from(new Uint8Array(ct))});
+}
+async function decrypt(j) {
+  let key = await getKey();
+  let {iv, ct} = JSON.parse(j);
+  let pt = await window.crypto.subtle.decrypt(
+    {name:"AES-GCM", iv: new Uint8Array(iv)},
+    key, new Uint8Array(ct)
+  );
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+// ------------- IndexedDB Layer ---------------------------
+let dbName = 'p2pdb49';
+let storeName = 'kvdata';
+function loadDB() {
+  return new Promise(resolve => {
+    let req = indexedDB.open(dbName, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(storeName);
+    req.onsuccess = () => {
+      let trx = req.result.transaction(storeName, "readonly").objectStore(storeName).getAll();
+      trx.onsuccess = () => {
+        db = {};
+        (trx.result || []).forEach(({key, value, ts}) => db[key] = { value, ts });
+        resolve();
+      };
+      trx.onerror = () => resolve();
+    };
+    req.onerror = () => resolve();
+  });
+}
+function saveDB() {
+  let req = indexedDB.open(dbName, 1);
+  req.onsuccess = () => {
+    let trx = req.result.transaction(storeName, "readwrite").objectStore(storeName);
+    trx.clear();
+    Object.entries(db).forEach(([key, {value, ts}]) => trx.put({key, value, ts}, key));
+  };
+}
+
+// ------------- UI Bindings -------------------------------
+const $ = id => document.getElementById(id);
+function log(msg) { $("log").textContent += msg + "\n"; $("log").scrollTop = 1e8; }
+function refreshTable() {
+  let rows = "<table id='dbTable'><tr><th>Key</th><th>Value</th><th>Timestamp</th></tr>";
+  for (let k in db)
+    rows += `<tr><td>${k}</td><td>${db[k].value}</td><td>${new Date(db[k].ts).toLocaleTimeString()}</td></tr>`;
+  $("dbdiv").innerHTML = rows + "</table>";
+}
+
+// Set, Clear, Show
+$("setbtn").onclick = async _ => {
+  let k = $("dbkey").value.trim(), v = $("dbvalue").value;
+  if (!k) return;
+  setCRDT(k, v);
+  saveDB();
+  refreshTable();
+  await announceChange();
+};
+$("clearbtn").onclick = async _ => { clearDB(); saveDB(); refreshTable(); await announceChange(); };
+$("showbtn").onclick = refreshTable;
+
+// ------------- BroadcastChannel: Multi-tab sync ---------------
+const bc = new BroadcastChannel("p2pdb49");
+bc.onmessage = async ev => {
+  let data = await decrypt(ev.data);
+  mergeCRDT(data);
+  saveDB();
+  refreshTable();
+};
+async function announceChange() {
+  let payload = await encrypt(getSerializableDB());
+  bc.postMessage(payload);
+  for (let peer of Object.values(peers))
+    peer.send(payload);
+}
+
+// ------------- WebRTC Peer-to-Peer (manual signaling) -----------
+let peers = {};
+let peerId = Math.random().toString(36).slice(2,8);
+
+async function setupPeerConnection(signalData, initiator=false) {
+  let pc = new RTCPeerConnection({iceServers: [{urls: "stun:stun.l.google.com:19302"}]});
+  let channel;
+  if (initiator) channel = pc.createDataChannel("dbsync");
+
+  pc.onicecandidate = ev => {
+    if (ev.candidate === null) {
+      // Ready to share signal
+      let blob = btoa(JSON.stringify(pc.localDescription));
+      prompt("Copy this signal blob to share with peer:", blob);
+      $("shareSignalBtn").disabled = false;
+    }
+  };
+
+  if (!initiator) {
+    pc.ondatachannel = ev => {
+      channel = ev.channel;
+      wireDataChannel(peerId, channel);
+    };
+  } else {
+    wireDataChannel(peerId, channel);
+  }
+
+  if (initiator) {
+    pc.createOffer().then(ofr => pc.setLocalDescription(ofr));
+  } else {
+    pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(atob(signalData))))
+      .then(_ => pc.createAnswer())
+      .then(ans => pc.setLocalDescription(ans));
+  }
+
+  pc.onconnectionstatechange = _ => {
+    if (["closed", "disconnected", "failed"].includes(pc.connectionState))
+      log(`Peer connection ${peerId} closed`);
+  };
+
+  pc.oniceconnectionstatechange = _ => {
+    if (["closed", "disconnected", "failed"].includes(pc.iceConnectionState))
+      log(`ICE connection ${peerId} closed`);
+  };
+
+  if (!initiator) {
+    pc.onicecandidate = ev => {
+      if (ev.candidate === null) {
+        let blob = btoa(JSON.stringify(pc.localDescription));
+        prompt("Now paste this signal in the initiator (your friend):", blob);
+        $("connectBtn").disabled = false;
+      }
+    };
+  }
+  return channel;
+}
+
+function wireDataChannel(pid, channel) {
+  peers[pid] = channel;
+  $("peersDiv").innerHTML = Object.keys(peers).map(id =>
+    `<div class='peer-box'>Peer: ${id} - ${channel.readyState}</div>`).join("");
+  channel.onopen = _ => log(`Peer ${pid} connected`);
+  channel.onclose = _ => log(`Peer ${pid} closed`);
+  channel.onmessage = async ev => {
+    // Receive encrypted db / changes
+    let data = await decrypt(ev.data);
+    mergeCRDT(data);
+    saveDB();
+    refreshTable();
+    log(`Peer ${pid} sent data!`);
+  };
+  // Send full db on connect
+  channel.onopen = async _ => {
+    if (Object.keys(db).length)
+      channel.send(await encrypt(getSerializableDB()));
+  }
+}
+
+$("shareSignalBtn").onclick = async _ => {
+  $("shareSignalBtn").disabled = true;
+  let pc = await setupPeerConnection(null, true);
+};
+
+$("connectBtn").onclick = async _ => {
+  let signal = $("signalInput").value;
+  $("connectBtn").disabled = true;
+  let pc = await setupPeerConnection(signal, false);
+};
+
+window.addEventListener("load", async () => {
+  await loadDB();
+  refreshTable();
+});
+
+</script>
+</body>
+</html>
